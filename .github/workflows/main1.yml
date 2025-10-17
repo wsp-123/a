@@ -1,0 +1,143 @@
+name: Create Admin + Enable RDP + Start SSH Tunnel
+on:
+  workflow_dispatch:
+
+# IMPORTANT: run on a self-hosted runner you control (label below is an example)
+jobs:
+  rdp-tunnel:
+    runs-on: windows-latest
+    concurrency:
+      group: rdp-tunnel-job
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout (for logs/artifacts)
+        uses: actions/checkout@v4
+
+      - name: Create admin user & store credentials (PowerShell)
+        shell: powershell
+        run: |
+          # Configuration: change username if desired
+          $Username = "rdpadmin"
+          # Generate a reasonably strong random password
+          $PasswordPlain = ([char[]](48..57 + 65..90 + 97..122) | Get-Random -Count 16) -join ''
+          $SecurePwd = ConvertTo-SecureString $PasswordPlain -AsPlainText -Force
+
+          # Create user if not exists
+          if (-not (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $Username -Password $SecurePwd -FullName "RDP Admin" -Description "Temporary admin created by workflow" -PasswordNeverExpires:$false
+              Write-Host "User $Username created."
+          } else {
+              Write-Host "User $Username already exists; resetting password."
+              $usr = Get-LocalUser -Name $Username
+              $usr | Set-LocalUser -Password $SecurePwd
+          }
+
+          # Add to Administrators group
+          Add-LocalGroupMember -Group "Administrators" -Member $Username -ErrorAction SilentlyContinue
+
+          # Save credentials to workspace (GITHUB_WORKSPACE on self-hosted runner is local)
+          $outPath = Join-Path $env:GITHUB_WORKSPACE "rdp-credentials.txt"
+          "Username: $Username" | Out-File -FilePath $outPath -Encoding utf8
+          "Password: $PasswordPlain" | Out-File -FilePath $outPath -Encoding utf8 -Append
+          "CreatedAt: $(Get-Date -Format o)" | Out-File -FilePath $outPath -Encoding utf8 -Append
+
+          Write-Host "Wrote credentials to $outPath. DELETE this file when finished."
+
+      - name: Enable Remote Desktop and open firewall (PowerShell, admin)
+        shell: powershell
+        run: |
+          # Enable Remote Desktop (set registry + enable service rules)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          # Enable Network Level Authentication (recommended)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+
+          # Ensure firewall rule to allow RDP exists and is enabled
+          # This creates the existing RDP rule if missing
+          if (-not (Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue)) {
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          } else {
+            Get-NetFirewallRule -DisplayGroup "Remote Desktop" | Enable-NetFirewallRule -ErrorAction SilentlyContinue
+          }
+
+          # Add the created user to Remote Desktop Users group (not strictly required if admin)
+          $Username = "rdpadmin"
+          try {
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username -ErrorAction Stop
+            Write-Host "Added $Username to Remote Desktop Users."
+          } catch {
+            Write-Host "Could not add to Remote Desktop Users (maybe already member): $_"
+          }
+
+          # (Optional) restart RDP service to be certain - service name is TermService
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP enabled and firewall configured."
+
+      - name: Ensure OpenSSH client exists (PowerShell)
+        shell: powershell
+        run: |
+          # Check if ssh is available
+          $sshPath = (Get-Command ssh -ErrorAction SilentlyContinue).Path
+          if (-not $sshPath) {
+            Write-Host "OpenSSH client not found. Attempting to enable Windows optional feature..."
+            # On Windows 10/2019/2022, OpenSSH.Client may be an optional capability
+            Add-WindowsCapability -Online -Name "OpenSSH.Client~~~~0.0.1.0" -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            $sshPath = (Get-Command ssh -ErrorAction SilentlyContinue).Path
+            if ($sshPath) {
+              Write-Host "OpenSSH client is now available at $sshPath"
+            } else {
+              Write-Host "OpenSSH client still not available. Please install an SSH client manually."
+              exit 1
+            }
+          } else {
+            Write-Host "ssh found at $sshPath"
+          }
+
+      - name: Start SSH reverse/forward tunnel (PowerShell background)
+        shell: powershell
+        env:
+          SSH_CMD: 'ssh -p 443 -R0:127.0.0.1:3389 -L4300:127.0.0.1:4300 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 XTUh54IKTWH@free.pinggy.io'
+        run: |
+          # Start ssh in a background process and capture output to a logfile in workspace
+          $log = Join-Path $env:GITHUB_WORKSPACE "ssh-tunnel.log"
+          $cmd = $env:SSH_CMD
+
+          Write-Host "Starting SSH tunnel with: $cmd"
+          # Use Start-Process so it continues to run after this step finishes (process stays on the machine)
+          $startInfo = @{
+            FilePath = "ssh"
+            ArgumentList = $cmd -replace '^\s*ssh\s+',''   # remove leading 'ssh' if present in SSH_CMD
+            RedirectStandardOutput = $true
+            RedirectStandardError  = $true
+            StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            StandardErrorEncoding  = [System.Text.Encoding]::UTF8
+            NoNewWindow = $true
+            WindowStyle = 'Hidden'
+          }
+
+          # Build the ArgumentList array properly:
+          # We need to split on spaces but preserve quoted fields; for simplicity, pass the entire raw argument string
+          $proc = Start-Process -FilePath "ssh" -ArgumentList $startInfo.ArgumentList -RedirectStandardOutput $startInfo.RedirectStandardOutput -RedirectStandardError $startInfo.RedirectStandardError -NoNewWindow -WindowStyle Hidden -PassThru
+
+          # Wait a little bit for initialization then dump initial output
+          Start-Sleep -Seconds 3
+          # Read available output (if any)
+          try {
+            # Note: we can't directly stream the redirects from Start-Process easily in PS Core older versions;
+            # as a simpler approach, run a background job that appends output via a separate process if needed.
+            Write-Host "SSH tunnel process Id: $($proc.Id). Check $log for logs."
+            "$((Get-Date).ToString('o')) - Started ssh (PID $($proc.Id))" | Out-File -FilePath $log -Encoding utf8 -Append
+          } catch {
+            Write-Host "Could not capture immediate stdout/stderr; check process manually."
+          }
+
+          Write-Host "SSH tunnel started in background. Monitor $log on the runner machine for details."
+
+      - name: Upload logs artifact (credentials & ssh log) - for secure download by runner owner
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-setup-logs
+          path: |
+            rdp-credentials.txt
+            ssh-tunnel.log
